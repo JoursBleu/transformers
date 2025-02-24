@@ -1860,18 +1860,74 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        outputs = self.model(
-            input_ids=None,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
+        if past_key_values.get_seq_length() == 0:
+            _, seqlen, _ = inputs_embeds.shape
+            sink_len = 128
+            block_size = 4096
+            bs = (seqlen - sink_len - 1) // block_size
+            current = sink_len
+            blocks = []
+            blocks_position_ids = []
+            sink_block = inputs_embeds[:, :sink_len, :]
+            sink_position_ids = position_ids[:, :, :sink_len]
+            while (current + block_size < seqlen):
+                block = inputs_embeds[:, current:current+block_size]
+                position_id = position_ids[:, :, current:current+block_size]
+                blocks.append(torch.cat((sink_block,block), 1))
+                blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 2))
+                current = current + block_size
+            tail_block = inputs_embeds[:, current:]
+            tail_position_ids = position_ids[:, :, current:]
+            inputs_embeds_batch = torch.cat(blocks, 0)
+            position_ids_batch = torch.cat(blocks_position_ids, 1)
+            outputs = self.model(
+                input_ids=None,
+                position_ids=position_ids_batch,
+                attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds_batch,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position[:sink_len+block_size],
+            )
+            batch_cache = outputs.past_key_values.batch_split(bs, 1)
+
+            first = True
+            for cache in batch_cache:
+                if first:
+                    past_key_values = cache
+                    first = False
+                else:
+                    cache.slice(sink_len, sink_len+block_size)
+                    past_key_values.concat(cache)
+
+            outputs = self.model(
+                input_ids=None,
+                position_ids=tail_position_ids,
+                attention_mask=attention_mask[:, current:],
+                past_key_values=past_key_values,
+                inputs_embeds=tail_block,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position[current:],
+            )
+        else:
+            outputs = self.model(
+                input_ids=None,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
