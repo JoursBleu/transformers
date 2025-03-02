@@ -19,6 +19,7 @@
 # limitations under the License.
 from typing import Callable, List, Optional, Tuple, Union
 
+import os
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -838,20 +839,88 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        _, seqlen = input_ids.shape
+        sink_len = 128
+        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
+        bs = (seqlen - sink_len - 1) // block_size
+        if past_key_values.get_seq_length() == 0 and bs > 0:
+            print("seqlen:", seqlen)
+            print("block_size", block_size)
+            print("block_num:", bs)
+            if inputs_embeds is None:
+                inputs_embeds = self.model.embed_tokens(input_ids)
+            if cache_position is None:
+                cache_position = torch.arange(
+                    0, inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
+
+            current = sink_len
+            blocks = []
+            blocks_position_ids = []
+            sink_block = inputs_embeds[:, :sink_len, :]
+            sink_position_ids = position_ids[:, :sink_len]
+            while (current + block_size < seqlen):
+                block = inputs_embeds[:, current:current+block_size]
+                position_id = position_ids[:, current:current+block_size]
+                blocks.append(torch.cat((sink_block,block), 1))
+                blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 1))
+                current = current + block_size
+            tail_block = inputs_embeds[:, current:]
+            tail_position_ids = position_ids[:, current:]
+            inputs_embeds_batch = torch.cat(blocks, 0)
+            position_ids_batch = torch.cat(blocks_position_ids, 0)
+            outputs = self.model(
+                input_ids=None,
+                position_ids=position_ids_batch,
+                attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds_batch,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position[:sink_len+block_size],
+            )
+            batch_cache = outputs.past_key_values.batch_split(bs, 1)
+
+            first = True
+            for cache in batch_cache:
+                if first:
+                    past_key_values = cache
+                    first = False
+                else:
+                    cache.slice(sink_len, sink_len+block_size)
+                    past_key_values.concat(cache)
+
+            outputs = self.model(
+                input_ids=None,
+                position_ids=tail_position_ids,
+                attention_mask=attention_mask[:, current:],
+                past_key_values=past_key_values,
+                inputs_embeds=tail_block,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position[current:],
+            )
+        else:
+            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
