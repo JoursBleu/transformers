@@ -868,7 +868,7 @@ class SpecialTokensMixin:
     def __init__(self, verbose=False, **kwargs):
         self._pad_token_type_id = 0
         self.verbose = verbose
-        self._special_tokens_map = {attr: None for attr in self.SPECIAL_TOKENS_ATTRIBUTES}
+        self._special_tokens_map = dict.fromkeys(self.SPECIAL_TOKENS_ATTRIBUTES)
         self._special_tokens_map["additional_special_tokens"] = []  # for BC where it defaults to empty list
 
         # We directly set the hidden value to allow initialization with special tokens
@@ -881,9 +881,9 @@ class SpecialTokensMixin:
             if key in self.SPECIAL_TOKENS_ATTRIBUTES:
                 if key == "additional_special_tokens":
                     assert isinstance(value, (list, tuple)), f"Value {value} is not a list or tuple"
-                    assert all(
-                        isinstance(t, (str, AddedToken)) for t in value
-                    ), "One of the tokens is not a string or an AddedToken"
+                    assert all(isinstance(t, (str, AddedToken)) for t in value), (
+                        "One of the tokens is not a string or an AddedToken"
+                    )
                     setattr(self, key, value)
                 elif isinstance(value, (str, AddedToken)):
                     setattr(self, key, value)
@@ -967,9 +967,9 @@ class SpecialTokensMixin:
                 logger.info(f"Assigning {value} to the {key} key of the tokenizer")
 
             if key == "additional_special_tokens":
-                assert isinstance(value, (list, tuple)) and all(
-                    isinstance(t, (str, AddedToken)) for t in value
-                ), f"Tokens {value} for key {key} should all be str or AddedToken instances"
+                assert isinstance(value, (list, tuple)) and all(isinstance(t, (str, AddedToken)) for t in value), (
+                    f"Tokens {value} for key {key} should all be str or AddedToken instances"
+                )
 
                 to_add = []
                 for token in value:
@@ -1184,7 +1184,7 @@ class SpecialTokensMixin:
         """
         Adds new special tokens to the "SPECIAL_TOKENS_ATTRIBUTES" list which will be part
         of "self.special_tokens" and saved as a special token in tokenizer's config.
-        This allows us to dynamically add new model-type specific tokens after initilizing the tokenizer.
+        This allows us to dynamically add new model-type specific tokens after initializing the tokenizer.
         For example: if the model tokenizers is multimodal, we can support special image or audio tokens.
         """
         self.SPECIAL_TOKENS_ATTRIBUTES = self.SPECIAL_TOKENS_ATTRIBUTES + list(special_tokens.keys())
@@ -1199,7 +1199,7 @@ ENCODE_KWARGS_DOCSTRING = r"""
             add_special_tokens (`bool`, *optional*, defaults to `True`):
                 Whether or not to add special tokens when encoding the sequences. This will use the underlying
                 `PretrainedTokenizerBase.build_inputs_with_special_tokens` function, which defines which tokens are
-                automatically added to the input ids. This is usefull if you want to add `bos` or `eos` tokens
+                automatically added to the input ids. This is useful if you want to add `bos` or `eos` tokens
                 automatically.
             padding (`bool`, `str` or [`~utils.PaddingStrategy`], *optional*, defaults to `False`):
                 Activates and controls padding. Accepts the following values:
@@ -2474,7 +2474,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         # no typefields, this way old fast and slow can load it
         tokenizer_config = self.convert_added_tokens(tokenizer_config, add_type_field=True, save=True)
 
-        # Process added tokens seperatly: allows previous versions to ignore it!
+        # Process added tokens separately: allows previous versions to ignore it!
         added_tokens = {}
         for key, value in self.added_tokens_decoder.items():
             added_tokens[key] = value.__getstate__()
@@ -3379,9 +3379,9 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
             return BatchEncoding(encoded_inputs, tensor_type=return_tensors)
 
         batch_size = len(required_input)
-        assert all(
-            len(v) == batch_size for v in encoded_inputs.values()
-        ), "Some items in the output dictionary have a different batch size than others."
+        assert all(len(v) == batch_size for v in encoded_inputs.values()), (
+            "Some items in the output dictionary have a different batch size than others."
+        )
 
         if padding_strategy == PaddingStrategy.LONGEST:
             max_length = max(len(inputs) for inputs in required_input)
