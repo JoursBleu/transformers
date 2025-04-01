@@ -1860,9 +1860,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
         _, seqlen, _ = inputs_embeds.shape
-        sink_len = 128
+        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 128
         block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
         bs = (seqlen - sink_len - 1) // block_size
+        # breakpoint()
         if past_key_values.get_seq_length() == 0 and bs > 0:
             print("seqlen:", seqlen)
             print("block_size", block_size)
