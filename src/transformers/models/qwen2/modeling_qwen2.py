@@ -858,6 +858,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         bs = (seqlen - sink_len - 1) // block_size
         if past_key_values.get_seq_length() == 0 and bs > 0:
             print("seqlen:", seqlen)
+            print("sink_len", sink_len)
             print("block_size", block_size)
             print("block_num:", bs)
             if inputs_embeds is None:
