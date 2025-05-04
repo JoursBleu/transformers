@@ -1845,9 +1845,14 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        block_size, _, _ = (
+            video_grid_thw[0][0],
+            video_grid_thw[0][1],
+            video_grid_thw[0][2],
+        )
         _, seqlen, _ = inputs_embeds.shape
-        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 128
-        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
+        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 15+block_size
+        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
         bs = (seqlen - sink_len - 1) // block_size
         # breakpoint()
         if past_key_values.get_seq_length() == 0 and bs > 0:
