@@ -423,7 +423,7 @@ class ModernBertUnpaddedRotaryEmbedding(RotaryEmbedding):
         """
         max_seqlen: if max_seqlen, device, and dtype are provided, we precompute the cos_sin_cache
             up to max_seqlen. If the max_seqlen, device, or dtype during training/inference differ,
-            the cos_sin_cache wll be recomputed during the forward pass.
+            the cos_sin_cache will be recomputed during the forward pass.
         """
         super().__init__(dim=dim, base=base, pos_idx_in_fp32=True, device=device, interleaved=False)
         self.max_seqlen = max_seqlen
@@ -477,7 +477,7 @@ class ModernBertEmbeddings(nn.Module):
         return self.drop(self.norm(self.tok_embeddings(input_ids)))
 
     def forward(
-        self, input_ids: torch.LongTensor = None, inputs_embeds: Optional[torch.Tensor] = None
+        self, input_ids: Optional[torch.LongTensor] = None, inputs_embeds: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if inputs_embeds is not None:
             hidden_states = self.drop(self.norm(inputs_embeds))
@@ -836,6 +836,10 @@ class ModernBertPreTrainedModel(PreTrainedModel):
             (ModernBertForSequenceClassification, ModernBertForTokenClassification, ModernBertForQuestionAnswering),
         ):
             init_weight(module.classifier, stds["final_out"])
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            if module.bias is not None:
+                module.bias.data.zero_()
 
     @classmethod
     def _autoset_attn_implementation(
