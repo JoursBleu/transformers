@@ -1845,26 +1845,33 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        _, seqlen, _ = inputs_embeds.shape
-        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 128
-        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
-        bs = (seqlen - sink_len - 1) // block_size
-        # breakpoint()
-        if past_key_values.get_seq_length() == 0 and bs > 0:
-            print("seqlen:", seqlen)
-            print("block_size", block_size)
-            print("block_num:", bs)
+        if past_key_values.get_seq_length() == 0:
+            sink_len = torch.where(input_ids == self.config.vision_start_token_id)[1].item()+1
+            question = torch.where(input_ids == self.config.vision_end_token_id)[1].item()+1
+            block_size = video_grid_thw[0][0].item()
+            _, seqlen, _ = inputs_embeds.shape
+            sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len+block_size
+            block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+            question = seqlen if 'BLOCK_SIZE' in os.environ else question
+            bs = (seqlen - sink_len - 1) // block_size
+            # breakpoint()
             current = sink_len
             blocks = []
             blocks_position_ids = []
             sink_block = inputs_embeds[:, :sink_len, :]
             sink_position_ids = position_ids[:, :, :sink_len]
-            while (current + block_size < seqlen):
+            bs = 0
+            print("seqlen:", seqlen)
+            print("question:", question)
+            print("block_size", block_size)
+            while (current + block_size <= question):
                 block = inputs_embeds[:, current:current+block_size]
                 position_id = position_ids[:, :, current:current+block_size]
                 blocks.append(torch.cat((sink_block,block), 1))
                 blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 2))
                 current = current + block_size
+                bs += 1
+            print("block_num:", bs)
             tail_block = inputs_embeds[:, current:]
             tail_position_ids = position_ids[:, :, current:]
             inputs_embeds_batch = torch.cat(blocks, 0)
