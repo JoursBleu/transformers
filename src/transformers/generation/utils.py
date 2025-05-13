@@ -391,7 +391,7 @@ class GenerationMixin:
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if not self.config.is_encoder_decoder:
             if inputs_embeds is not None and cache_position[0] == 0:
-                model_inputs[input_ids_key] = None
+                model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
                 model_inputs["inputs_embeds"] = inputs_embeds
             else:
                 # `clone` calls in this function ensure a consistent stride. See #32227

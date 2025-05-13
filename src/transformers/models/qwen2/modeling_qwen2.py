@@ -828,8 +828,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        # if (input_ids is None) ^ (inputs_embeds is not None):
+            # raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -1166,12 +1166,21 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             _, seqlen, _ = inputs_embeds.shape
         elif input_ids is not None:
             _, seqlen = input_ids.shape
-        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 128
-        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
+        block_size = 257
+        # _, sink_len = torch.where(input_ids==151650)
+        sink_len = 13 + block_size
+        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
+        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+        use_pos = int(os.environ['USE_POS'])>0 if 'USE_POS' in os.environ else True
+        # bs = (seqlen-input_ids.shape[1]+1)//block_size - 1
         bs = (seqlen - sink_len - 1) // block_size
-        if past_key_values.get_seq_length() == 0 and bs > 0:
+        if past_key_values.get_seq_length() == 0 and seqlen>8192:
             print("seqlen:", seqlen, flush=True)
-            print("sink_len", sink_len)
+            print("input_ids:", input_ids.shape[1], flush=True)
+            print("seqlen - input_ids:", seqlen-input_ids.shape[1], flush=True)
+            print("(seqlen - input_ids)/256:", (seqlen-input_ids.shape[1]+1)/256, flush=True)
+            print("sink_len", sink_len, flush=True)
+            print("use_pos", use_pos, flush=True)
             print("block_size", block_size, flush=True)
             print("block_num:", bs, flush=True)
             current = sink_len
@@ -1179,6 +1188,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             blocks_position_ids = []
             sink_block = inputs_embeds[:, :sink_len, :]
             sink_position_ids = position_ids[:, :sink_len]
+            # while (current < sink_len + bs*block_size):
             while (current + block_size < seqlen):
                 block = inputs_embeds[:, current:current+block_size]
                 position_id = position_ids[:, current:current+block_size]
@@ -1191,7 +1201,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             position_ids_batch = torch.cat(blocks_position_ids, 0)
             outputs = self.model(
                 input_ids=None,
-                position_ids=position_ids_batch,
+                position_ids=position_ids_batch if use_pos else None,
                 attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds_batch,
@@ -1214,7 +1224,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
             outputs = self.model(
                 input_ids=None,
-                position_ids=tail_position_ids,
+                position_ids=tail_position_ids if use_pos else None,
                 attention_mask=attention_mask[:, current:],
                 past_key_values=past_key_values,
                 inputs_embeds=tail_block,
