@@ -1845,26 +1845,34 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        block_size, _, _ = (
-            video_grid_thw[0][0],
-            video_grid_thw[0][1],
-            video_grid_thw[0][2],
-        )
         _, seqlen, _ = inputs_embeds.shape
-        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 15+block_size
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+        t, h, w = (
+            video_grid_thw[0][0],
+            video_grid_thw[0][1] // spatial_merge_size,
+            video_grid_thw[0][2] // spatial_merge_size,
+        )
+        block_size = h * w
+        sink_len = 15 + block_size
+        USE_PAVLM = int(os.environ['USE_PAVLM']) if 'USE_PAVLM' in os.environ else 0
+        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
         block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
-        bs = (seqlen - sink_len - 1) // block_size
+        # bs = (seqlen - sink_len - 1) // block_size
+        bs = (t-1)
         # breakpoint()
-        if past_key_values.get_seq_length() == 0 and bs > 0:
+        if past_key_values.get_seq_length() == 0 and bs > 0 and USE_PAVLM:
             print("seqlen:", seqlen)
             print("block_size", block_size)
             print("block_num:", bs)
+            print("t:", t)
+            print("h:", h)
+            print("w:", w)
             current = sink_len
             blocks = []
             blocks_position_ids = []
             sink_block = inputs_embeds[:, :sink_len, :]
             sink_position_ids = position_ids[:, :, :sink_len]
-            while (current + block_size < seqlen):
+            while (current < sink_len + bs*block_size):
                 block = inputs_embeds[:, current:current+block_size]
                 position_id = position_ids[:, :, current:current+block_size]
                 blocks.append(torch.cat((sink_block,block), 1))
