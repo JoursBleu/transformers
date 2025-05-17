@@ -241,6 +241,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        # self.top_p = self.top_k * 1. / self.num_experts
+        self.top_p = 0.2
         self.norm_topk_prob = config.norm_topk_prob
 
         # gating
@@ -248,6 +250,31 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.experts = nn.ModuleList(
             [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
         )
+
+    def get_softmax_indices(self, softmax_output):
+        # 对每个样本的 softmax 输出进行降序排序，同时获取排序后的索引
+        sorted_values, sorted_indices = torch.sort(softmax_output, descending=True, dim=-1)
+        # 计算每个样本的累积和
+        cumulative_sums = torch.cumsum(sorted_values, dim=-1)
+        # 找到每个样本中累积和大于 0.5 的第一个位置
+        mask = cumulative_sums < self.top_p
+        indices = mask.sum(1) + 1
+        all_selected_indices = []
+        all_selected_probs = []
+        for i in range(softmax_output.shape[0]):
+            stop_index = indices[i].item() + 1
+            selected_indices = sorted_indices[i][:indices[i]]
+            selected_probs = sorted_values[i][:indices[i]]
+            all_selected_indices.append(selected_indices)
+            all_selected_probs.append(selected_probs)
+        return all_selected_indices, all_selected_probs
+
+    def indices_to_onehot(self, indices):
+        batch_size = len(indices)
+        onehot_batch = torch.zeros((batch_size, self.num_experts), device=indices[0].device)
+        for i, sample_indices in enumerate(indices):
+            onehot_batch[i, sample_indices] = 1
+        return onehot_batch.to(torch.int64)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -257,11 +284,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        selected_experts, routing_weights = self.get_softmax_indices(routing_weights)
+        # routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = [w / w.sum(dim=-1, keepdim=True) for w in routing_weights]
         # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        # routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -269,22 +297,27 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_mask = self.indices_to_onehot(selected_experts).permute(1, 0)
+        # expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+            # idx, token_id = torch.where(expert_mask[expert_idx])
+            token_id = torch.where(expert_mask[expert_idx])[0]
+            if len(token_id) == 0:
+                continue
 
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            current_state = hidden_states[None, token_id].reshape(-1, hidden_dim)
+            current_state = expert_layer(current_state)
+            current_hidden_states = current_state*(router_logits[token_id, expert_idx].unsqueeze(1))
 
             # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            # the `token_id` tensor here.
+            final_hidden_states.index_add_(0, token_id, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 

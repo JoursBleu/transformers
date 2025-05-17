@@ -649,7 +649,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            breakpoint()
             top_x = torch.where(expert_mask[expert_idx])
 
             # Index the correct hidden states and compute the expert hidden state for
