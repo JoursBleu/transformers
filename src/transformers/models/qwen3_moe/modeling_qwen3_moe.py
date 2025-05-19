@@ -22,6 +22,8 @@
 from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -242,7 +244,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         # self.top_p = self.top_k * 1. / self.num_experts
-        self.top_p = 0.2
+        self.top_p = float(os.environ['TOP_P']) if 'TOP_P' in os.environ else 0.1
         self.norm_topk_prob = config.norm_topk_prob
 
         # gating
@@ -256,15 +258,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         sorted_values, sorted_indices = torch.sort(softmax_output, descending=True, dim=-1)
         # 计算每个样本的累积和
         cumulative_sums = torch.cumsum(sorted_values, dim=-1)
-        # 找到每个样本中累积和大于 0.5 的第一个位置
+        # 找到每个样本中累积和大于 top_p 的第一个位置
         mask = cumulative_sums < self.top_p
         indices = mask.sum(1) + 1
         all_selected_indices = []
         all_selected_probs = []
+        # print("stop_index", indices, flush=True)
         for i in range(softmax_output.shape[0]):
-            stop_index = indices[i].item() + 1
-            selected_indices = sorted_indices[i][:indices[i]]
-            selected_probs = sorted_values[i][:indices[i]]
+            stop_index = indices[i] if 'TOP_P' in os.environ else self.top_k
+            selected_indices = sorted_indices[i][:stop_index]
+            selected_probs = sorted_values[i][:stop_index]
             all_selected_indices.append(selected_indices)
             all_selected_probs.append(selected_probs)
         return all_selected_indices, all_selected_probs
@@ -283,11 +286,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        selected_experts, routing_weights = self.get_softmax_indices(routing_weights)
+        routing_weights_all = F.softmax(router_logits, dim=1, dtype=torch.float)
+        selected_experts, routing_weights = self.get_softmax_indices(routing_weights_all)
         # routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-            routing_weights = [w / w.sum(dim=-1, keepdim=True) for w in routing_weights]
+            routing_weights_sum = [w.sum(dim=-1, keepdim=True) for w in routing_weights]
+            routing_weights_sum = torch.concat(routing_weights_sum)
+            routing_weights_all /= routing_weights_sum[:, None]
         # we cast back to the input dtype
         # routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -313,7 +318,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
             current_state = hidden_states[None, token_id].reshape(-1, hidden_dim)
             current_state = expert_layer(current_state)
-            current_hidden_states = current_state*(router_logits[token_id, expert_idx].unsqueeze(1))
+            current_hidden_states = current_state*(routing_weights_all[token_id, expert_idx, None])
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `token_id` tensor here.
