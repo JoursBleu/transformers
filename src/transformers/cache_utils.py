@@ -401,13 +401,22 @@ class DynamicCache(Cache):
         """
         return len(self.key_cache)
 
-    def slice(self, start: int, end: int):
+    def slice_inplace(self, start: int, end: int):
         for layer_idx in range(len(self.key_cache)):
             self.key_cache[layer_idx] = self.key_cache[layer_idx][:,:,start:end,:]
             self.value_cache[layer_idx] = self.value_cache[layer_idx][:,:,start:end,:]
 
         self._seen_tokens = self.key_cache[0].shape[-2]
         return
+
+    def slice(self, start: int, end: int):
+        out = DynamicCache()
+        for layer_idx in range(len(self.key_cache)):
+            out.key_cache.append(self.key_cache[layer_idx][:,:,start:end,:])
+            out.value_cache.append(self.value_cache[layer_idx][:,:,start:end,:])
+
+        out._seen_tokens = out.key_cache[0].shape[-2]
+        return out
 
     def concat(self, cache):
         for layer_idx in range(len(self.key_cache)):
