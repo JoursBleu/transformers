@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -870,6 +871,8 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
         else:
             sliding_window = None
 
+        # torch.cuda.synchronize()
+        # start = time.time()
         attn_output = _flash_attention_forward(
             query_states,
             key_states,
@@ -881,6 +884,10 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
             is_causal=self.is_causal,
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
         )
+        # torch.cuda.synchronize()
+        # end = time.time()
+        # infer_time = (end - start) * 1000
+        # print("time:", infer_time, flush=True)
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -1116,6 +1123,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        # torch.cuda.synchronize()
+        # start = time.time()
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1204,6 +1213,10 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+        # torch.cuda.synchronize()
+        # end = time.time()
+        # infer_time = (end - start) * 1000
+        # print("time:", infer_time, flush=True)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1852,58 +1865,89 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             video_grid_thw[0][1] // spatial_merge_size,
             video_grid_thw[0][2] // spatial_merge_size,
         )
-        block_size = h * w
-        sink_len = 15 + block_size
         USE_PAVLM = int(os.environ['USE_PAVLM']) if 'USE_PAVLM' in os.environ else 0
-        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
-        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
-        # bs = (seqlen - sink_len - 1) // block_size
-        bs = (t-1)
+        if USE_PAVLM and 'USE_FRAME' in os.environ:
+            sink_frame_num = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
+            block_frame_num = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+            block_size = h * w * block_frame_num
+            sink_len = h * w * sink_frame_num + 15
+        elif USE_PAVLM:
+            sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
+            block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+        else:
+            sink_len = 0
+            block_size = seqlen
+            head_size = 0
+        bs = (seqlen - sink_len - 1) // block_size
+        if USE_PAVLM and 'USE_FRAME' in os.environ:
+            bs = ((t-sink_frame_num)//block_frame_num)
+            head_frame_num = ((t-sink_frame_num)%block_frame_num)
+            head_size = h * w * head_frame_num
+            # sink_frame_num = t-bs*block_frame_num
+            # sink_len = h * w * sink_frame_num + 15
         # breakpoint()
+        print("USE_PAVLM:", USE_PAVLM)
+        print("seqlen:", seqlen)
+        print("sink_len:", sink_len)
+        print("head_size:", head_size)
+        print("block_size", block_size)
+        print("block_num:", bs)
+        print("tail size:", seqlen - block_size*bs - sink_len - head_size)
+        print("t:", t)
+        print("h:", h)
+        print("w:", w)
         if past_key_values.get_seq_length() == 0 and bs > 0 and USE_PAVLM:
-            print("seqlen:", seqlen)
-            print("block_size", block_size)
-            print("block_num:", bs)
-            print("t:", t)
-            print("h:", h)
-            print("w:", w)
-            current = sink_len
+            sink_block = inputs_embeds[:, :sink_len+head_size, :]
+            sink_position_ids = position_ids[:, :, :sink_len+head_size]
+            if sink_len > 0:
+                sink_outputs = self.model(
+                    input_ids=None,
+                    position_ids=sink_position_ids if use_pos else None,
+                    attention_mask=attention_mask[:, :sink_len+head_size],
+                    past_key_values=past_key_values,
+                    inputs_embeds=sink_block,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                    cache_position=cache_position[:sink_len+head_size],
+                )
+                past_key_values = sink_outputs.past_key_values.slice(0, sink_len)
+                past_key_values.batch_repeat_interleave(bs)
+            current = sink_len+head_size
             blocks = []
             blocks_position_ids = []
-            sink_block = inputs_embeds[:, :sink_len, :]
-            sink_position_ids = position_ids[:, :, :sink_len]
-            while (current < sink_len + bs*block_size):
+            while (current < sink_len+head_size + bs*block_size):
                 block = inputs_embeds[:, current:current+block_size]
                 position_id = position_ids[:, :, current:current+block_size]
-                blocks.append(torch.cat((sink_block,block), 1))
-                blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 2))
+                blocks.append(block)
+                blocks_position_ids.append(position_id)
                 current = current + block_size
+            assert(current == sink_len+head_size + bs*block_size)
             tail_block = inputs_embeds[:, current:]
             tail_position_ids = position_ids[:, :, current:]
             inputs_embeds_batch = torch.cat(blocks, 0)
             position_ids_batch = torch.cat(blocks_position_ids, 1)
             outputs = self.model(
                 input_ids=None,
-                position_ids=position_ids_batch,
-                attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
+                position_ids=position_ids_batch if use_pos else None,
+                attention_mask=attention_mask[:, sink_len:sink_len+block_size].expand(bs, -1),
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds_batch,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=True,
-                cache_position=cache_position[:sink_len+block_size],
+                cache_position=cache_position[sink_len:sink_len+block_size],
             )
             batch_cache = outputs.past_key_values.batch_split(bs, 1)
 
-            first = True
+            past_key_values = sink_outputs.past_key_values
             for cache in batch_cache:
-                if first:
-                    past_key_values = cache
-                    first = False
-                else:
-                    cache.slice(sink_len, sink_len+block_size)
-                    past_key_values.concat(cache)
+                cache.slice_inplace(sink_len, sink_len+block_size)
+                past_key_values.concat(cache)
 
             outputs = self.model(
                 input_ids=None,
