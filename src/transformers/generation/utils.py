@@ -391,7 +391,7 @@ class GenerationMixin:
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if not self.config.is_encoder_decoder:
             if inputs_embeds is not None and cache_position[0] == 0:
-                model_inputs[input_ids_key] = None
+                model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
                 model_inputs["inputs_embeds"] = inputs_embeds
             else:
                 # `clone` calls in this function ensure a consistent stride. See #32227
@@ -3219,6 +3219,8 @@ class GenerationMixin:
             next_token_logits = outputs.logits.clone()[:, -1, :].float()
             next_token_logits = next_token_logits.to(input_ids.device)
 
+            bs = input_ids.shape[0]
+            input_ids = input_ids[input_ids!=-200].reshape(bs,-1)
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
 
