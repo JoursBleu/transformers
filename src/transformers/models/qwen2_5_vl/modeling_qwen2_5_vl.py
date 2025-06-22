@@ -1897,29 +1897,31 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if past_key_values.get_seq_length() == 0 and bs > 0 and USE_PAVLM:
             sink_block = inputs_embeds[:, :sink_len, :]
             sink_position_ids = position_ids[:, :, :sink_len]
-            if sink_len > 0:
-                outputs = self.model(
-                    input_ids=None,
-                    position_ids=sink_position_ids if use_pos else None,
-                    attention_mask=attention_mask[:, :sink_len],
-                    past_key_values=past_key_values,
-                    inputs_embeds=sink_block,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=True,
-                    cache_position=cache_position[:sink_len],
-                )
-                past_key_values = outputs.past_key_values
-                past_key_values.batch_repeat_interleave(bs)
+            # if sink_len > 0:
+                # outputs = self.model(
+                    # input_ids=None,
+                    # position_ids=sink_position_ids if use_pos else None,
+                    # attention_mask=attention_mask[:, :sink_len],
+                    # past_key_values=past_key_values,
+                    # inputs_embeds=sink_block,
+                    # use_cache=use_cache,
+                    # output_attentions=output_attentions,
+                    # output_hidden_states=output_hidden_states,
+                    # return_dict=True,
+                    # cache_position=cache_position[:sink_len],
+                # )
+                # past_key_values = outputs.past_key_values
+                # past_key_values.batch_repeat_interleave(bs)
             current = sink_len
             blocks = []
             blocks_position_ids = []
             while (current < sink_len + bs*block_size):
                 block = inputs_embeds[:, current:current+block_size]
                 position_id = position_ids[:, :, current:current+block_size]
-                blocks.append(block)
-                blocks_position_ids.append(position_id)
+                blocks.append(torch.cat((sink_block,block), 1))
+                blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 2))
+                # blocks.append(block)
+                # blocks_position_ids.append(position_id)
                 current = current + block_size
             tail_block = inputs_embeds[:, current:]
             tail_position_ids = position_ids[:, :, current:]
@@ -1928,14 +1930,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             outputs = self.model(
                 input_ids=None,
                 position_ids=position_ids_batch if use_pos else None,
-                attention_mask=attention_mask[:, sink_len:sink_len+block_size].expand(bs, -1),
+                attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
+                # attention_mask=attention_mask[:, sink_len:sink_len+block_size].expand(bs, -1),
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds_batch,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=True,
-                cache_position=cache_position[sink_len:sink_len+block_size],
+                cache_position=cache_position[:sink_len+block_size],
+                # cache_position=cache_position[sink_len:sink_len+block_size],
             )
             batch_cache = outputs.past_key_values.batch_split(bs, 1)
 
