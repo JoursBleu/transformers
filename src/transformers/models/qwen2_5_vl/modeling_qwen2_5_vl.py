@@ -1949,7 +1949,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     past_key_values = cache
                     first = False
                 else:
-                    cache.slice(sink_len, sink_len+block_size)
+                    cache.slice_inplace(sink_len, sink_len+block_size)
                     past_key_values.concat(cache)
 
             outputs = self.model(
