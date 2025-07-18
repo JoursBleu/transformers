@@ -1166,19 +1166,34 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             _, seqlen, _ = inputs_embeds.shape
         elif input_ids is not None:
             _, seqlen = input_ids.shape
-        block_size = 257
-        # _, sink_len = torch.where(input_ids==151650)
-        sink_len = 13 + block_size
-        sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
-        block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
-        use_pos = int(os.environ['USE_POS'])>0 if 'USE_POS' in os.environ else True
-        # bs = (seqlen-input_ids.shape[1]+1)//block_size - 1
-        bs = (seqlen - sink_len - 1) // block_size
-        if past_key_values.get_seq_length() == 0 and seqlen>8192:
+        # block_size = 257
+        # # _, sink_len = torch.where(input_ids==151650)
+        # sink_len = 13 + block_size
+        # sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
+        # block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+        # use_pos = int(os.environ['USE_POS'])>0 if 'USE_POS' in os.environ else True
+        # # bs = (seqlen-input_ids.shape[1]+1)//block_size - 1
+        USE_PAVLM = int(os.environ['USE_PAVLM']) if 'USE_PAVLM' in os.environ else 0
+        if USE_PAVLM and 'USE_FRAME' in os.environ:
+            sink_frame_num = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
+            block_frame_num = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+            block_size = 257 * block_frame_num
+            sink_len = 257 * sink_frame_num + 14
+            bs = (seqlen-input_ids.shape[1]+1-sink_len+14)//block_size
+        elif USE_PAVLM:
+            sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
+            block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+            bs = (seqlen - sink_len - 1) // block_size
+        else:
+            sink_len = 0
+            block_size = seqlen
+            bs = 0
+        # bs = (seqlen - sink_len - 1) // block_size
+        if past_key_values.get_seq_length() == 0 and bs > 1 and USE_PAVLM:
             print("seqlen:", seqlen, flush=True)
             print("input_ids:", input_ids.shape[1], flush=True)
-            print("seqlen - input_ids:", seqlen-input_ids.shape[1], flush=True)
-            print("(seqlen - input_ids)/256:", (seqlen-input_ids.shape[1]+1)/256, flush=True)
             print("sink_len", sink_len, flush=True)
             print("use_pos", use_pos, flush=True)
             print("block_size", block_size, flush=True)
@@ -1188,12 +1203,30 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             blocks_position_ids = []
             sink_block = inputs_embeds[:, :sink_len, :]
             sink_position_ids = position_ids[:, :sink_len]
+            if sink_len > 0:
+                outputs = self.model(
+                    input_ids=None,
+                    position_ids=sink_position_ids if use_pos else None,
+                    attention_mask=attention_mask[:, :sink_len],
+                    past_key_values=past_key_values,
+                    inputs_embeds=sink_block,
+                    use_cache=use_cache,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    cache_position=cache_position[:sink_len],
+                )
+                past_key_values = outputs.past_key_values
+                past_key_values.batch_repeat_interleave(bs)
+
             # while (current < sink_len + bs*block_size):
-            while (current + block_size < seqlen):
+            while (current < sink_len + bs*block_size):
                 block = inputs_embeds[:, current:current+block_size]
                 position_id = position_ids[:, current:current+block_size]
-                blocks.append(torch.cat((sink_block,block), 1))
-                blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 1))
+                # blocks.append(torch.cat((sink_block,block), 1))
+                # blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 1))
+                blocks.append(block)
+                blocks_position_ids.append(position_id)
                 current = current + block_size
             tail_block = inputs_embeds[:, current:]
             tail_position_ids = position_ids[:, current:]
@@ -1202,14 +1235,16 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             outputs = self.model(
                 input_ids=None,
                 position_ids=position_ids_batch if use_pos else None,
+                # attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
                 attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds_batch,
                 use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                output_attentions=False,
+                output_hidden_states=False,
                 return_dict=True,
-                cache_position=cache_position[:sink_len+block_size],
+                # cache_position=cache_position[:sink_len+block_size],
+                cache_position=cache_position[sink_len:sink_len+block_size],
             )
             batch_cache = outputs.past_key_values.batch_split(bs, 1)
 
@@ -1225,7 +1260,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             outputs = self.model(
                 input_ids=None,
                 position_ids=tail_position_ids if use_pos else None,
-                attention_mask=attention_mask[:, current:],
+                attention_mask=attention_mask[:, :],
                 past_key_values=past_key_values,
                 inputs_embeds=tail_block,
                 use_cache=use_cache,
