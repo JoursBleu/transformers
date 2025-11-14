@@ -7,6 +7,7 @@
 from collections.abc import Callable
 from typing import Optional, Union
 
+import os
 import torch
 from torch import nn
 
@@ -423,7 +424,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
-
 
 @auto_docstring
 class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):

@@ -95,6 +95,23 @@ class DynamicLayer(CacheLayerMixin):
         self.values = torch.tensor([], dtype=self.dtype, device=self.device)
         self.is_initialized = True
 
+    def slice(self, start: int, end: int):
+        for layer_idx in range(len(self.key_cache)):
+            self.key_cache[layer_idx] = self.key_cache[layer_idx][:,:,start:end,:]
+            self.value_cache[layer_idx] = self.value_cache[layer_idx][:,:,start:end,:]
+
+        self._seen_tokens = self.key_cache[0].shape[-2]
+        return
+
+    def concat(self, cache):
+        for layer_idx in range(len(self.key_cache)):
+            self.update(
+                cache.key_cache[layer_idx],
+                cache.value_cache[layer_idx],
+                layer_idx,
+            )
+        return
+
     def update(
         self,
         key_states: torch.Tensor,
