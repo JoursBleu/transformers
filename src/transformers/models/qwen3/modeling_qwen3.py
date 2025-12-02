@@ -22,6 +22,8 @@
 from collections.abc import Callable
 from typing import Optional, Union
 
+import os
+import time
 import torch
 from torch import nn
 
@@ -503,16 +505,115 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        if inputs_embeds is not None:
+            _, seqlen, _ = inputs_embeds.shape
+        elif input_ids is not None:
+            _, seqlen = input_ids.shape
+        USE_PAVLM = int(os.environ['USE_PAVLM']) if 'USE_PAVLM' in os.environ else 0
+        if USE_PAVLM and 'USE_FRAME' in os.environ:
+            sink_frame_num = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 0
+            block_frame_num = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+            block_size = 264 * block_frame_num
+            sink_len = 264 * sink_frame_num + 40
+            bs = (self.textbegin - sink_len)//block_size - 1
+        elif USE_PAVLM:
+            sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else sink_len
+            block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else block_size
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+            bs = (seqlen - sink_len - 1) // block_size
+        else:
+            sink_len = 0
+            block_size = seqlen
+            bs = (seqlen - sink_len - 1) // block_size
+
+        if (past_key_values is None or past_key_values.get_seq_length() == 0) and bs > 0 and USE_PAVLM:
+            print("seqlen:", seqlen, flush=True)
+            print("sink_len", sink_len, flush=True)
+            print("block_size", block_size, flush=True)
+            print("block_num:", bs, flush=True)
+
+            if cache_position is None:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                cache_position = torch.arange(
+                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+
+            sink_block = inputs_embeds[:, :sink_len, :]
+            sink_position_ids = position_ids[:, :sink_len]
+            if sink_len > 0:
+                outputs = self.model(
+                    input_ids=None,
+                    position_ids=sink_position_ids if use_pos else None,
+                    attention_mask=attention_mask[:, :sink_len],
+                    past_key_values=past_key_values,
+                    inputs_embeds=sink_block,
+                    use_cache=use_cache,
+                    cache_position=cache_position[:sink_len],
+                    **kwargs,
+                )
+                past_key_values = outputs.past_key_values
+                past_key_values.batch_repeat_interleave(bs)
+
+            current = sink_len
+            blocks = []
+            blocks_position_ids = []
+            while (current < sink_len + bs*block_size):
+                block = inputs_embeds[:, current:current+block_size]
+                position_id = position_ids[:, current:current+block_size]
+                # blocks.append(torch.cat((sink_block,block), 1))
+                # blocks_position_ids.append(torch.cat((sink_position_ids,position_id), 1))
+                blocks.append(block)
+                blocks_position_ids.append(position_id)
+                current = current + block_size
+            tail_block = inputs_embeds[:, current:]
+            tail_position_ids = position_ids[:, current:]
+            inputs_embeds_batch = torch.cat(blocks, 0)
+            position_ids_batch = torch.cat(blocks_position_ids, 0)
+            outputs = self.model(
+                input_ids=None,
+                position_ids=position_ids_batch if use_pos else None,
+                # attention_mask=attention_mask[:, :sink_len+block_size].expand(bs, -1),
+                attention_mask=attention_mask[:, sink_len:sink_len+block_size].expand(bs, -1),
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds_batch,
+                use_cache=use_cache,
+                # cache_position=cache_position[:sink_len+block_size],
+                cache_position=cache_position[sink_len:sink_len+block_size],
+                **kwargs,
+            )
+            batch_cache = outputs.past_key_values.batch_split(bs, 1)
+
+            first = True
+            for cache in batch_cache:
+                if first:
+                    past_key_values = cache
+                    first = False
+                else:
+                    cache.slice(sink_len, sink_len+block_size)
+                    past_key_values.concat(cache)
+
+            outputs: BaseModelOutputWithPast = self.model(
+                input_ids=None,
+                position_ids=tail_position_ids if use_pos else None,
+                attention_mask=attention_mask[:, current:],
+                past_key_values=past_key_values,
+                inputs_embeds=tail_block,
+                use_cache=use_cache,
+                cache_position=cache_position[current:],
+                **kwargs,
+            )
+        else:
+            outputs: BaseModelOutputWithPast = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss

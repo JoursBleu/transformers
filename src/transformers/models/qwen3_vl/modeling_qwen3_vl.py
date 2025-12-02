@@ -23,6 +23,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
+import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -889,11 +891,14 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
             # add visual features to the hidden states of first several layers
             if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[layer_idx],
-                )
+                if visual_pos_masks is None:
+                    hidden_states = hidden_states + deepstack_visual_embeds[layer_idx]
+                else:
+                    hidden_states = self._deepstack_process(
+                        hidden_states,
+                        visual_pos_masks,
+                        deepstack_visual_embeds[layer_idx],
+                    )
 
         hidden_states = self.norm(hidden_states)
 
@@ -1250,17 +1255,142 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        outputs = self.language_model(
-            input_ids=None,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
-            **kwargs,
+        _, seqlen, _ = inputs_embeds.shape
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+        t, h, w = (
+            video_grid_thw[0][0],
+            video_grid_thw[0][1] // spatial_merge_size,
+            video_grid_thw[0][2] // spatial_merge_size,
         )
+        USE_PAVLM = int(os.environ['USE_PAVLM']) if 'USE_PAVLM' in os.environ else 0
+        if USE_PAVLM and 'USE_FRAME' in os.environ:
+            sink_frame_num = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 0
+            block_frame_num = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+            block_size = (7 + h * w) * block_frame_num
+            sink_len = 14 + (7 + h * w) * sink_frame_num
+        elif USE_PAVLM:
+            sink_len = int(os.environ['SINK_SIZE']) if 'SINK_SIZE' in os.environ else 0
+            block_size = int(os.environ['BLOCK_SIZE']) if 'BLOCK_SIZE' in os.environ else seqlen
+            use_pos = int(os.environ['USE_POS']) if 'USE_POS' in os.environ else 1
+            head_size = 0
+        else:
+            sink_len = 0
+            block_size = seqlen
+            head_size = 0
+        bs = (seqlen - sink_len - 1) // block_size
+        if USE_PAVLM and 'USE_FRAME' in os.environ:
+            bs = ((t-sink_frame_num)//block_frame_num)
+            head_frame_num = ((t-sink_frame_num)%block_frame_num)
+            head_size = (7 + h * w) * head_frame_num
+            # sink_frame_num = t-bs*block_frame_num
+            # sink_len = 14 + h * w * sink_frame_num
+        # breakpoint()
+        print("USE_PAVLM:", USE_PAVLM)
+        print("seqlen:", seqlen)
+        print("sink_len:", sink_len)
+        print("head_size:", head_size)
+        print("block_size", block_size)
+        print("block_num:", bs)
+        print("tail size:", seqlen - block_size*bs - sink_len - head_size)
+        print("t:", t)
+        print("h:", h)
+        print("w:", w)
+
+        if (past_key_values is None or past_key_values.get_seq_length() == 0) and bs > 1 and USE_PAVLM:
+            # 处理 deepstack
+            deepstacks = []
+            for index in range(len(deepstack_visual_embeds)):
+                deepstack = torch.zeros(inputs_embeds[0].shape, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+                deepstack[visual_pos_masks[0], :] = deepstack_visual_embeds[index]
+                deepstacks.append(deepstack)
+            sink_block = inputs_embeds[:, :sink_len+head_size, :]
+            sink_position_ids = position_ids[:, :, :sink_len+head_size]
+            if sink_len > 0:
+                print("processing sink",flush=True)
+                sink_outputs = self.language_model(
+                    input_ids=None,
+                    position_ids=sink_position_ids if use_pos else None,
+                    attention_mask=attention_mask[:, :sink_len+head_size],
+                    past_key_values=past_key_values,
+                    inputs_embeds=sink_block,
+                    cache_position=cache_position[:sink_len+head_size],
+                    visual_pos_masks=None,
+                    deepstack_visual_embeds=[ele[:sink_len+head_size] for ele in deepstacks],
+                    **kwargs,
+                )
+                past_key_values = sink_outputs.past_key_values.slice(0, sink_len)
+                past_key_values.batch_repeat_interleave(bs)
+            current = sink_len+head_size
+            blocks = []
+            blocks_position_ids = []
+            blocks_deepstacks = []
+            for index in range(len(deepstacks)):
+                blocks_deepstacks.append([])
+            while (current < sink_len+head_size + bs*block_size):
+                block = inputs_embeds[:, current:current+block_size]
+                position_id = position_ids[:, :, current:current+block_size]
+                blocks.append(block)
+                blocks_position_ids.append(position_id)
+                for index in range(len(deepstacks)):
+                    deepstack = deepstacks[index][current:current+block_size, :]
+                    blocks_deepstacks[index].append(deepstack.unsqueeze(0))
+                current = current + block_size
+            assert(current == sink_len+head_size + bs*block_size)
+            tail_block = inputs_embeds[:, current:]
+            tail_position_ids = position_ids[:, :, current:]
+            inputs_embeds_batch = torch.cat(blocks, 0)
+            position_ids_batch = torch.cat(blocks_position_ids, 1)
+            for index in range(len(deepstacks)):
+                blocks_deepstacks[index] = torch.cat(blocks_deepstacks[index], 0)
+            print("processing blocks",flush=True)
+            outputs = self.language_model(
+                input_ids=None,
+                position_ids=position_ids_batch if use_pos else None,
+                attention_mask=attention_mask[:, sink_len:sink_len+block_size].expand(bs, -1),
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds_batch,
+                cache_position=cache_position[sink_len:sink_len+block_size],
+                visual_pos_masks=None,
+                deepstack_visual_embeds=blocks_deepstacks,
+                **kwargs,
+            )
+            outputs.past_key_values.slice_inplace(sink_len, sink_len+block_size)
+            batch_cache = outputs.past_key_values.batch_split(bs, 1)
+
+            if sink_len > 0:
+                past_key_values = sink_outputs.past_key_values
+                past_key_values.concat(batch_cache[0])
+            else:
+                past_key_values = batch_cache[0]
+
+            for i in range(len(batch_cache)):
+                past_key_values.concat(batch_cache[i])
+
+            print("processing query",flush=True)
+            outputs = self.language_model(
+                input_ids=None,
+                position_ids=tail_position_ids,
+                attention_mask=attention_mask[:, current:],
+                past_key_values=past_key_values,
+                inputs_embeds=tail_block,
+                cache_position=cache_position[current:],
+                visual_pos_masks=None,
+                deepstack_visual_embeds=[ele[current:] for ele in deepstacks],
+                **kwargs,
+            )
+        else:
+            outputs = self.language_model(
+                input_ids=None,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                visual_pos_masks=visual_pos_masks,
+                deepstack_visual_embeds=deepstack_visual_embeds,
+                **kwargs,
+            )
 
         return Qwen3VLModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,

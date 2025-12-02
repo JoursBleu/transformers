@@ -95,23 +95,6 @@ class DynamicLayer(CacheLayerMixin):
         self.values = torch.tensor([], dtype=self.dtype, device=self.device)
         self.is_initialized = True
 
-    def slice(self, start: int, end: int):
-        for layer_idx in range(len(self.key_cache)):
-            self.key_cache[layer_idx] = self.key_cache[layer_idx][:,:,start:end,:]
-            self.value_cache[layer_idx] = self.value_cache[layer_idx][:,:,start:end,:]
-
-        self._seen_tokens = self.key_cache[0].shape[-2]
-        return
-
-    def concat(self, cache):
-        for layer_idx in range(len(self.key_cache)):
-            self.update(
-                cache.key_cache[layer_idx],
-                cache.value_cache[layer_idx],
-                layer_idx,
-            )
-        return
-
     def update(
         self,
         key_states: torch.Tensor,
@@ -1016,6 +999,46 @@ class DynamicCache(Cache):
     def __iter__(self):
         for layer in self.layers:
             yield layer.keys, layer.values, getattr(layer, "_sliding_window_tensor", None)
+
+    def slice_inplace(self, start: int, end: int):
+        for layer_idx in range(len(self.layers)):
+            self.layers[layer_idx].keys = self.layers[layer_idx].keys[:,:,start:end,:]
+            self.layers[layer_idx].values = self.layers[layer_idx].values[:,:,start:end,:]
+        return
+
+    def slice(self, start: int, end: int):
+        out = DynamicCache()
+        for layer_idx in range(len(self.layers)):
+            out.update(
+                key_states=self.layers[layer_idx].keys[:,:,start:end,:],
+                value_states=self.layers[layer_idx].values[:,:,start:end,:],
+                layer_idx=layer_idx,
+            )
+        return out
+
+    def concat(self, cache):
+        for layer_idx in range(len(self.layers)):
+            self.update(
+                cache.layers[layer_idx].keys,
+                cache.layers[layer_idx].values,
+                layer_idx,
+            )
+        return
+
+    def batch_split(self, full_batch_size: int, split_size: int):
+        assert(full_batch_size%split_size == 0)
+        outs = []
+        for index in range(full_batch_size//split_size):
+            outs.append(DynamicCache())
+        for layer_idx in range(len(self.layers)):
+            for index in range(full_batch_size//split_size):
+                outs[index].update(
+                    self.layers[layer_idx].keys[index:index+split_size],
+                    self.layers[layer_idx].values[index:index+split_size],
+                    layer_idx,
+                )
+
+        return outs
 
 
 class StaticCache(Cache):
