@@ -20,6 +20,7 @@
 from typing import Callable, Optional, Union
 
 import torch
+import os
 from torch import nn
 
 from ...activations import ACT2FN
@@ -338,6 +339,19 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        if os.environ['SPEC_LEN'] is not None:
+            config.spec_token = int(os.environ['SPEC_LEN'])
+        if config.spec_token > 0:
+            # 全 0 初始化
+            # self.spec_embed_tokens = nn.Parameter(torch.zeros(config.spec_token, config.hidden_size))
+
+            # 方法1: 用 eos_token embedding 初始化
+            # spec_embed_tokens = self.embed_tokens.weight[tokenizer.eos_token_id].unsqueeze(0).repeat(config.spec_token, 1)
+            # self.spec_embed_tokens = nn.Parameter(spec_embed_tokens.clone())
+
+            # 方法2: 用随机初始化（但非零）
+            self.spec_embed_tokens = nn.Parameter(torch.randn(config.spec_token, config.hidden_size) * 0.02)
+
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -365,7 +379,17 @@ class LlamaModel(LlamaPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+            if self.config.spec_token > 0:
+                full_embed = torch.cat([self.embed_tokens.weight, self.spec_embed_tokens], dim=0)
+                inputs_embeds = torch.nn.functional.embedding(
+                    input_ids,
+                    full_embed,
+                    padding_idx=self.padding_idx,
+                    scale_grad_by_freq=False,
+                    sparse=False
+                )
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
