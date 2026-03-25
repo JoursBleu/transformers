@@ -583,8 +583,13 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
     if parsed_parameters["config"]["model_type"] == "gemma3":
         parsed_parameters["config"]["model_type"] = "gemma3_text"
 
-    # MiniMax-M2: convert expert_gating_func integer to scoring_func string
-    if parsed_parameters["config"].get("model_type") == "minimax_m2":
+    # DeepSeek2 GGUF architecture is shared by DeepSeek V2/V3/V3.2,
+    # map to deepseek_v3 which is recognized by transformers
+    if parsed_parameters["config"]["model_type"] == "deepseek2":
+        parsed_parameters["config"]["model_type"] = "deepseek_v3"
+
+    # MiniMax-M2 / DeepSeek2: convert expert_gating_func integer to scoring_func string
+    if parsed_parameters["config"].get("model_type") in ("minimax_m2", "deepseek_v3"):
         _gating_func_map = {0: "none", 1: "softmax", 2: "sigmoid"}
         _scoring = parsed_parameters["config"].get("scoring_func")
         if isinstance(_scoring, int):
