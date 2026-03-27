@@ -352,6 +352,126 @@ class MiniMaxM2TensorProcessor(TensorProcessor):
             out.copy_(torch_weights)
 
 
+class DeepSeek2TensorProcessor(TensorProcessor):
+    """
+    Tensor processor for DeepSeek V2/V3/V3.2 GGUF models.
+
+    Handles:
+    - MoE expert weights: ffn_gate_exps + ffn_up_exps -> gate_up_proj (merged)
+    - MLA weights: attn_k_b + attn_v_b -> kv_b_proj (merged)
+    - e_score_correction_bias mapping
+    """
+
+    HF_EXPERT_RENAME_PATTERN = re.compile(r"mlp\.experts\.\d+\.")
+    HF_MOE_W13_PATTERN = re.compile(r"(?:model\.)?layers\.(?P<bid>\d+)\.mlp\.experts\.gate_up_proj")
+    GGUF_MOE_WEIGHTS_PATTERN = re.compile(r"(?P<name>.*\.ffn_(?P<w>gate|down|up)_exps)\.weight$")
+    HF_BIAS_PATTERN = re.compile(r"(?:model\.)?layers\.(?P<bid>\d+)\.mlp\.gate\.e_score_correction_bias")
+    HF_KV_B_PATTERN = re.compile(r"(?:model\.)?layers\.(?P<bid>\d+)\.self_attn\.kv_b_proj")
+    GGUF_KV_B_PATTERN = re.compile(r"(?P<name>.*\.attn_(?P<kv>k_b|v_b))\.weight$")
+
+    def __init__(self, config=None):
+        super().__init__(config=config)
+
+    def preprocess_name(self, hf_name: str) -> str:
+        return re.sub(self.HF_EXPERT_RENAME_PATTERN, "mlp.experts.", hf_name)
+
+    def perform_fallback_tensor_mapping(
+        self, gguf_to_hf_name_map: dict[str, str], suffix: str, qual_name: str, hf_name: str
+    ):
+        # Map merged gate_up_proj to both ffn_gate_exps and ffn_up_exps GGUF tensors.
+        if m := re.fullmatch(self.HF_MOE_W13_PATTERN, hf_name):
+            full_hf_name = qual_name + hf_name
+            gguf_to_hf_name_map[f"blk.{m['bid']}.ffn_gate_exps{suffix}"] = full_hf_name
+            gguf_to_hf_name_map[f"blk.{m['bid']}.ffn_up_exps{suffix}"] = full_hf_name
+        # Map e_score_correction_bias to GGUF exp_probs_b.bias.
+        elif m := re.fullmatch(self.HF_BIAS_PATTERN, hf_name):
+            gguf_to_hf_name_map[f"blk.{m['bid']}.exp_probs_b.bias"] = qual_name + hf_name
+        # Map kv_b_proj to both attn_k_b and attn_v_b GGUF tensors.
+        elif m := re.fullmatch(self.HF_KV_B_PATTERN, hf_name):
+            full_hf_name = qual_name + hf_name
+            gguf_to_hf_name_map[f"blk.{m['bid']}.attn_k_b{suffix}"] = full_hf_name
+            gguf_to_hf_name_map[f"blk.{m['bid']}.attn_v_b{suffix}"] = full_hf_name
+
+    def process(self, weights, name: str, **kwargs):
+        # Handle MoE expert weights (gate/up/down)
+        if m := re.fullmatch(self.GGUF_MOE_WEIGHTS_PATTERN, name):
+            tensor_key_mapping = kwargs.get("tensor_key_mapping")
+            parsed_parameters = kwargs.get("parsed_parameters")
+            if tensor_key_mapping:
+                self._set_moe_expert_tensor(weights, parsed_parameters, tensor_key_mapping[m["name"]], m["w"])
+            return GGUFTensor(weights, None, {})
+        # Handle k_b / v_b -> kv_b_proj merging
+        if m := re.fullmatch(self.GGUF_KV_B_PATTERN, name):
+            tensor_key_mapping = kwargs.get("tensor_key_mapping")
+            parsed_parameters = kwargs.get("parsed_parameters")
+            if tensor_key_mapping:
+                self._set_kv_b_tensor(weights, parsed_parameters, tensor_key_mapping[m["name"]], m["kv"])
+            return GGUFTensor(weights, None, {})
+        return GGUFTensor(weights, name, {})
+
+    def _set_moe_expert_tensor(self, weights, parsed_parameters, hf_name, w):
+        torch_weights = torch.from_numpy(np.copy(weights))
+        if w == "down":
+            parsed_parameters["tensors"][hf_name] = torch_weights
+        else:
+            # Merge gate and up into gate_up_proj [num_experts, 2*intermediate, hidden]
+            shape = list(weights.shape)
+            shard_dim = 1
+            shard_size = shape[shard_dim]
+            shape[shard_dim] = shard_size * 2
+            if hf_name not in parsed_parameters["tensors"]:
+                parsed_parameters["tensors"][hf_name] = torch.zeros(shape, dtype=torch_weights.dtype)
+            out = parsed_parameters["tensors"][hf_name]
+            if w == "gate":
+                out = out.narrow(shard_dim, 0, shard_size)
+            else:  # w == "up"
+                out = out.narrow(shard_dim, shard_size, shard_size)
+            out.copy_(torch_weights)
+
+    def _set_kv_b_tensor(self, weights, parsed_parameters, hf_name, kv):
+        """
+        Merge separate k_b and v_b GGUF tensors into a single kv_b_proj weight.
+
+        GGUF stores:
+          attn_k_b: [num_heads, kv_lora_rank, qk_nope_head_dim]
+          attn_v_b: [kv_lora_rank, num_heads, v_head_dim]
+
+        HF expects kv_b_proj.weight: [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+        """
+        torch_weights = torch.from_numpy(np.copy(weights))
+        num_heads = self.config.get("num_attention_heads", 128)
+        kv_lora_rank = self.config.get("kv_lora_rank", 512)
+        qk_nope_head_dim = self.config.get("qk_nope_head_dim", 128)
+        v_head_dim = self.config.get("v_head_dim", 128)
+        total_dim = num_heads * (qk_nope_head_dim + v_head_dim)
+
+        if hf_name not in parsed_parameters["tensors"]:
+            parsed_parameters["tensors"][hf_name] = torch.zeros(
+                total_dim, kv_lora_rank, dtype=torch_weights.dtype
+            )
+        out = parsed_parameters["tensors"][hf_name]
+
+        if kv == "k_b":
+            # attn_k_b: [num_heads, kv_lora_rank, qk_nope_head_dim]
+            # -> permute to [num_heads, qk_nope_head_dim, kv_lora_rank]
+            # -> reshape to [num_heads * qk_nope_head_dim, kv_lora_rank]
+            k = torch_weights.permute(0, 2, 1).reshape(num_heads * qk_nope_head_dim, kv_lora_rank)
+            # Place k in the first part of each head's block
+            # kv_b_proj layout: for each head h, [k_nope(h), v(h)] concatenated
+            for h in range(num_heads):
+                start = h * (qk_nope_head_dim + v_head_dim)
+                out[start : start + qk_nope_head_dim] = k[h * qk_nope_head_dim : (h + 1) * qk_nope_head_dim]
+        else:  # v_b
+            # attn_v_b: [kv_lora_rank, num_heads, v_head_dim]
+            # -> permute to [num_heads, v_head_dim, kv_lora_rank]
+            # -> reshape to [num_heads * v_head_dim, kv_lora_rank]
+            v = torch_weights.permute(1, 2, 0).reshape(num_heads * v_head_dim, kv_lora_rank)
+            # Place v in the second part of each head's block
+            for h in range(num_heads):
+                start = h * (qk_nope_head_dim + v_head_dim) + qk_nope_head_dim
+                out[start : start + v_head_dim] = v[h * v_head_dim : (h + 1) * v_head_dim]
+
+
 TENSOR_PROCESSORS = {
     "llama": LlamaTensorProcessor,
     "qwen2moe": Qwen2MoeTensorProcessor,
@@ -366,6 +486,7 @@ TENSOR_PROCESSORS = {
     "gemma3": Gemma2TensorProcessor,
     "lfm2": Lfm2TensorProcessor,
     "minimax-m2": MiniMaxM2TensorProcessor,
+    "deepseek2": DeepSeek2TensorProcessor,
 }
 
 
@@ -414,6 +535,8 @@ def get_gguf_hf_weights_map(
         model_type = "gemma3"
     elif model_type == "umt5":
         model_type = "t5"
+    elif model_type == "deepseek_v3":
+        model_type = "deepseek2"
     elif model_type == "minimax_m2":
         model_type = "minimax-m2"
     arch = None
