@@ -398,14 +398,30 @@ class DeepSeek2TensorProcessor(TensorProcessor):
             tensor_key_mapping = kwargs.get("tensor_key_mapping")
             parsed_parameters = kwargs.get("parsed_parameters")
             if tensor_key_mapping:
-                self._set_moe_expert_tensor(weights, parsed_parameters, tensor_key_mapping[m["name"]], m["w"])
+                bid = re.search(r"blk\.(\d+)", name).group(1)
+                if m["w"] == "down":
+                    # ffn_down_exps is mapped directly in tensor_key_mapping
+                    hf_name = tensor_key_mapping.get(m["name"]) or tensor_key_mapping.get(m["name"] + ".weight")
+                else:
+                    # gate/up: GGUF has separate tensors but HF has merged gate_up_proj
+                    # Look up the merged tensor name in tensor_key_mapping
+                    merged_key = f"blk.{bid}.ffn_gate_up_exps"
+                    hf_name = tensor_key_mapping.get(merged_key) or tensor_key_mapping.get(merged_key + ".weight")
+                if hf_name:
+                    self._set_moe_expert_tensor(weights, parsed_parameters, hf_name, m["w"])
             return GGUFTensor(weights, None, {})
         # Handle k_b / v_b -> kv_b_proj merging
         if m := re.fullmatch(self.GGUF_KV_B_PATTERN, name):
             tensor_key_mapping = kwargs.get("tensor_key_mapping")
             parsed_parameters = kwargs.get("parsed_parameters")
             if tensor_key_mapping:
-                self._set_kv_b_tensor(weights, parsed_parameters, tensor_key_mapping[m["name"]], m["kv"])
+                # GGUF has separate attn_k_b/attn_v_b but HF has merged kv_b_proj
+                # Look up the merged tensor name in tensor_key_mapping
+                bid = re.search(r"blk\.(\d+)", name).group(1)
+                merged_key = f"blk.{bid}.attn_kv_b"
+                hf_name = tensor_key_mapping.get(merged_key) or tensor_key_mapping.get(merged_key + ".weight")
+                if hf_name:
+                    self._set_kv_b_tensor(weights, parsed_parameters, hf_name, m["kv"])
             return GGUFTensor(weights, None, {})
         return GGUFTensor(weights, name, {})
 
